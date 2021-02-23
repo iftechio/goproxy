@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: goproxy
+  name: goproxy
+  namespace: infra
+spec:
+  ports:
+  - name: http
+    port: 8081
+    protocol: TCP
+    targetPort: 8081
+  selector:
+    app: goproxy
+  sessionAffinity: None
+  type: ClusterIP
