@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: goproxy
+  name: goproxy
+  namespace: infra
+spec:
+  serviceName: goproxy
+  replicas: 1
+  selector:
+    matchLabels:
+      app: goproxy
+  template:
+    metadata:
+      labels:
+        app: goproxy
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: role
+                operator: In
+                values:
+                - app
+      automountServiceAccountToken: true
+      containers:
+      - env:
+        - name: HTTPS_PROXY
+          value: http://jike:kYEwE4vnkMoJpWdaG]ANXxxNMenRC@47.52.119.148:4443
+        - name: NO_PROXY
+          value: goproxy.cn,mirrors.aliyun.com
+        - name: GITHUB_TOKEN_LOGIN
+          valueFrom:
+            configMapKeyRef:
+              key: GITHUB_TOKEN_LOGIN
+              name: group.goproxy-config
+        - name: GITHUB_TOKEN_PASSWORD
+          valueFrom:
+            configMapKeyRef:
+              key: GITHUB_TOKEN_PASSWORD
+              name: group.goproxy-config
+        image: registry-vpc.cn-hangzhou.aliyuncs.com/iftech/goproxy:fix-env-2c39839
+        imagePullPolicy: IfNotPresent
+        args:
+        - -listen=0.0.0.0:8081
+        - -cacheDir=/ext
+        - -proxy=https://goproxy.cn
+        - -exclude=github.com/iftechio
+        name: rabbitmq
+        ports:
+        - containerPort: 8081
+          name: http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 300m
+            memory: 1000Mi
+          requests:
+            cpu: 300m
+            memory: 1000Mi
+        volumeMounts:
+        - mountPath: /ext
+          name: goproxy-cache
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 600
+  volumeClaimTemplates:
+  - metadata:
+      name: goproxy-cache
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 100Gi
+      storageClassName: alicloud-disk-ssd
+      volumeMode: Filesystem

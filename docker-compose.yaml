@@ -1,8 +1,15 @@
 version: "2"
 services:
   goproxy:
-    image: goproxy/goproxy:latest
-    command: "-listen=0.0.0.0:8081 -cacheDir=/ext"
+    image: registry.cn-hangzhou.aliyuncs.com/iftech/goproxy:fix-env-d9e6dff
+    command: "-listen=0.0.0.0:8081 -cacheDir=/ext -proxy=https://goproxy.cn -exclude=github.com/iftechio"
+    environment:
+    - HTTPS_PROXY=http://jike:kYEwE4vnkMoJpWdaG]ANXxxNMenRC@47.52.119.148:4443
+    - HTTP_PROXY=http://jike:kYEwE4vnkMoJpWdaG]ANXxxNMenRC@47.52.119.148:4443
+    - NO_PROXY=goproxy.cn,mirrors.aliyun.com
+    # 本地开发可以从 jkdpy 上的 goproxy-config 找到对应的 token
+    - GITHUB_TOKEN_LOGIN=${GITHUB_TOKEN_LOGIN}
+    - GITHUB_TOKEN_PASSWORD=${GITHUB_TOKEN_PASSWORD}
     ports:
     - "8081:8081"
     restart: always
