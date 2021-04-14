@@ -5,3 +5,5 @@ cacheDir/*
 bin/
 .netrc
 .env
+__debug_bin
+
