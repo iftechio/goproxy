@@ -11,7 +11,8 @@ A global proxy for go modules. see: [https://goproxy.io](https://goproxy.io)
 本项目用来构建即刻内部的 goproxy 代理，封装了如下细节：
 
 - 通过 proxy 加速访问 github 私有 repo。
-- 使用 goproxy.cn 代理 golang 官方 sum.golang.org 的校验。
+- 使用多个 upstream backend 代理公共 repo，默认情况下优先从 https://goproxy.cn 拉取依赖，支持重试，如果重试仍然不过，会继续使用 https://mirrors.aliyun.com/goproxy/ 代理再次重试。
+- 使用 https://goproxy.cn 代理 golang 官方 sum.golang.org 的校验。
 - 增加一层 cache。
 
 用户在使用时只需要配置如下环境变量即可：

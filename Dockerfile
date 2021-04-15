@@ -1,4 +1,4 @@
-FROM golang:alpine AS build
+FROM registry.cn-hangzhou.aliyuncs.com/iftech/golang:1.15-alpine AS build
 
 RUN apk add --no-cache -U make git mercurial subversion
 
@@ -7,7 +7,7 @@ RUN cd /src/goproxy &&\
     export CGO_ENABLED=0 &&\
     make
 
-FROM golang:alpine
+FROM registry.cn-hangzhou.aliyuncs.com/iftech/golang:1.15-alpine
 
 # Add tini
 ENV TINI_VERSION v0.19.0

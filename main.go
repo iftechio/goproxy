@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goproxyio/goproxy/v2/customflag"
 	"github.com/goproxyio/goproxy/v2/netrc"
 	"github.com/goproxyio/goproxy/v2/proxy"
 
@@ -45,14 +46,16 @@ const listExpire = proxy.ListExpire
 
 var listen string
 var cacheDir string
-var proxyHost string
+var proxyHosts customflag.ProxyFlag
 var excludeHost string
+var test bool
 
 func init() {
 	flag.StringVar(&excludeHost, "exclude", "", "exclude host pattern")
-	flag.StringVar(&proxyHost, "proxy", "", "next hop proxy for go modules")
+	flag.Var(&proxyHosts, "proxy", "next hop proxies for go modules")
 	flag.StringVar(&cacheDir, "cacheDir", "", "go modules cache dir")
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
+	flag.BoolVar(&test, "test", false, "ignore generating netrc file, only for test")
 	flag.Parse()
 
 	if os.Getenv("GIT_TERMINAL_PROMPT") == "" {
@@ -74,8 +77,10 @@ func init() {
 
 	downloadRoot = getDownloadRoot()
 	os.Setenv("GOMODCACHE", downloadRoot)
-	if err := netrc.GenerateDotNetrcFile(); err != nil {
-		log.Fatalf("Failed to generate .netrc file, Error: %s", err.Error())
+	if !test {
+		if err := netrc.GenerateDotNetrcFile(); err != nil {
+			log.Fatalf("Failed to generate .netrc file, Error: %s", err.Error())
+		}
 	}
 }
 
@@ -84,14 +89,14 @@ func main() {
 	log.SetFlags(0)
 
 	var handle http.Handler
-	if proxyHost != "" {
-		log.Printf("ProxyHost %s\n", proxyHost)
+	if len(proxyHosts.URLs) != 0 {
+		log.Printf("ProxyHosts %s\n", proxyHosts.String())
 		if excludeHost != "" {
 			log.Printf("ExcludeHost %s\n", excludeHost)
 		}
 		handle = &logger{proxy.NewRouter(proxy.NewServer(new(ops)), &proxy.RouterOptions{
 			Pattern:      excludeHost,
-			Proxy:        proxyHost,
+			Proxies:      proxyHosts.URLs,
 			DownloadRoot: downloadRoot,
 		})}
 	} else {
@@ -172,7 +177,7 @@ func (l *logger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rl := &responseLogger{code: 200, ResponseWriter: w}
 	l.h.ServeHTTP(rl, r)
-	log.Printf("%.3fs %d %s\n", time.Since(start).Seconds(), rl.code, r.URL)
+	log.Printf("request: %.3fs %d %s%s\n", time.Since(start).Seconds(), rl.code, r.Host, r.URL)
 }
 
 // An ops is a proxy.ServerOps implementation.

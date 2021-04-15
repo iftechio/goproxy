@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,7 +28,7 @@ const ListExpire = 5 * time.Minute
 // RouterOptions provides the proxy host and the external pattern
 type RouterOptions struct {
 	Pattern      string
-	Proxy        string
+	Proxies      []*url.URL
 	DownloadRoot string
 }
 
@@ -34,10 +36,10 @@ type RouterOptions struct {
 // which implements Route Filter to
 // routing private module or public module .
 type Router struct {
-	srv          *Server
-	proxy        *httputil.ReverseProxy
-	pattern      string
-	downloadRoot string
+	srv           *Server
+	proxyUpstream *Upstream
+	pattern       string
+	downloadRoot  string
 }
 
 // NewRouter returns a new Router using the given operations.
@@ -45,107 +47,141 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 	rt := &Router{
 		srv: srv,
 	}
+	upstream := &Upstream{}
 	if opts != nil {
-		if opts.Proxy == "" {
+		if len(opts.Proxies) == 0 {
 			log.Printf("not set proxy, all direct.")
 			return rt
 		}
-		remote, err := url.Parse(opts.Proxy)
-		if err != nil {
-			log.Printf("parse proxy fail, all direct.")
-			return rt
-		}
-		proxy := httputil.NewSingleHostReverseProxy(remote)
-		director := proxy.Director
-		proxy.Director = func(r *http.Request) {
-			director(r)
-			r.Host = remote.Host
-		}
-		rt.proxy = proxy
+		for _, url := range opts.Proxies {
+			url := url
+			proxy := httputil.NewSingleHostReverseProxy(url)
 
-		rt.proxy.Transport = &http.Transport{
-			Proxy:           http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		rt.proxy.ModifyResponse = func(r *http.Response) error {
-			if r.StatusCode == http.StatusOK {
-				var buf []byte
-				if strings.Contains(r.Header.Get("Content-Encoding"), "gzip") {
-					gr, err := gzip.NewReader(r.Body)
-					if err != nil {
-						return err
-					}
-					defer gr.Close()
-					buf, err = ioutil.ReadAll(gr)
-					if err != nil {
-						return err
-					}
-					r.Header.Del("Content-Encoding")
-				} else {
-					buf, err = ioutil.ReadAll(r.Body)
-					if err != nil {
-						return err
-					}
-				}
-				r.Body = ioutil.NopCloser(bytes.NewReader(buf))
-				if buf != nil {
-					file := filepath.Join(opts.DownloadRoot, r.Request.URL.Path)
-					os.MkdirAll(path.Dir(file), os.ModePerm)
-					err = renameio.WriteFile(file, buf, 0666)
-					if err != nil {
-						return err
-					}
-				}
+			upstream.AddBackend(&Backend{
+				URL:          url,
+				ReverseProxy: proxy,
+			})
+
+			director := proxy.Director
+			proxy.Director = func(r *http.Request) {
+				director(r)
+				r.Host = url.Host
 			}
 
-			// support 302 status code.
-			if r.StatusCode == http.StatusFound {
-				loc := r.Header.Get("Location")
-				if loc == "" {
-					return fmt.Errorf("%d response missing Location header", r.StatusCode)
+			proxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, err error) {
+				retries := GetRetryTimesFromContext(r)
+				if retries == 0 {
+					log.Printf("%s proxy error: %s, will try to retry %d times\n", r.Host, err.Error(), RetryWithSameBackendTimes)
 				}
-
-				// TODO: location is relative.
-				_, err := url.Parse(loc)
-				if err != nil {
-					return fmt.Errorf("failed to parse Location header %q: %v", loc, err)
+				if retries < RetryWithSameBackendTimes {
+					<-time.After(100 * time.Millisecond)
+					ctx := context.WithValue(r.Context(), RetryTimesWithSameBackendKey{}, retries+1)
+					proxy.ServeHTTP(rw, r.WithContext(ctx))
+					return
 				}
-				resp, err := http.Get(loc)
-				if err != nil {
-					return err
-				}
-				defer resp.Body.Close()
-
-				var buf []byte
-				if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
-					gr, err := gzip.NewReader(resp.Body)
-					if err != nil {
-						return err
-					}
-					defer gr.Close()
-					buf, err = ioutil.ReadAll(gr)
-					if err != nil {
-						return err
-					}
-					resp.Header.Del("Content-Encoding")
-				} else {
-					buf, err = ioutil.ReadAll(resp.Body)
-					if err != nil {
-						return err
-					}
-				}
-				resp.Body = ioutil.NopCloser(bytes.NewReader(buf))
-				if buf != nil {
-					file := filepath.Join(opts.DownloadRoot, r.Request.URL.Path)
-					os.MkdirAll(path.Dir(file), os.ModePerm)
-					err = renameio.WriteFile(file, buf, 0666)
-					if err != nil {
-						return err
-					}
-				}
+				// 如果重试后仍然不成功，继续尝试将请求发往剩下的 backend
+				backendIndex := GetBackendIndexFromContext(r)
+				backendIndex = backendIndex + 1
+				ctx := context.WithValue(r.Context(), BackendIndexKey{}, backendIndex)
+				log.Printf("%s proxy error: %s, the request still fails after retrying, will send request to next backend, index: %d\n", r.Host, err.Error(), backendIndex)
+				upstream.RoundRobin(rw, r.WithContext(ctx))
 			}
-			return nil
+
+			proxy.Transport = &http.Transport{
+				Proxy:           http.ProxyFromEnvironment,
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+
+			proxy.ModifyResponse = func(r *http.Response) error {
+				log.Printf("upstream proxy: %d %s", r.StatusCode, r.Request.URL)
+				if r.StatusCode == http.StatusOK {
+					var buf []byte
+					var err error
+					if strings.Contains(r.Header.Get("Content-Encoding"), "gzip") {
+						gr, err := gzip.NewReader(r.Body)
+						if err != nil {
+							return err
+						}
+						defer gr.Close()
+						buf, err = ioutil.ReadAll(gr)
+						if err != nil {
+							return err
+						}
+						r.Header.Del("Content-Encoding")
+						decompressedBodyLength := strconv.Itoa(len(buf))
+						r.Header.Set("Content-Length", decompressedBodyLength)
+					} else {
+						buf, err = ioutil.ReadAll(r.Body)
+						if err != nil {
+							return err
+						}
+					}
+					r.Body = ioutil.NopCloser(bytes.NewReader(buf))
+					if buf != nil {
+						file := filepath.Join(opts.DownloadRoot, r.Request.URL.Path)
+						os.MkdirAll(path.Dir(file), os.ModePerm)
+						err = renameio.WriteFile(file, buf, 0666)
+						if err != nil {
+							return err
+						}
+					}
+				}
+
+				// support 302 status code.
+				if r.StatusCode == http.StatusFound {
+					loc := r.Header.Get("Location")
+					if loc == "" {
+						return fmt.Errorf("%d response missing Location header", r.StatusCode)
+					}
+
+					// TODO: location is relative.
+					_, err := url.Parse(loc)
+					if err != nil {
+						return fmt.Errorf("failed to parse Location header %q: %v", loc, err)
+					}
+					resp, err := http.Get(loc)
+					if err != nil {
+						return err
+					}
+					defer resp.Body.Close()
+
+					var buf []byte
+					if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+						gr, err := gzip.NewReader(resp.Body)
+						if err != nil {
+							return err
+						}
+						defer gr.Close()
+						buf, err = ioutil.ReadAll(gr)
+						if err != nil {
+							return err
+						}
+						resp.Header.Del("Content-Encoding")
+					} else {
+						buf, err = ioutil.ReadAll(resp.Body)
+						if err != nil {
+							return err
+						}
+					}
+					resp.Body = ioutil.NopCloser(bytes.NewReader(buf))
+					if buf != nil {
+						file := filepath.Join(opts.DownloadRoot, r.Request.URL.Path)
+						os.MkdirAll(path.Dir(file), os.ModePerm)
+						err = renameio.WriteFile(file, buf, 0666)
+						if err != nil {
+							return err
+						}
+					}
+				}
+				// // 此段代码用来测试重试逻辑
+				// if r.StatusCode == http.StatusNotFound {
+				// 	return errors.New("not found")
+				// }
+				return nil
+			}
 		}
+
+		rt.proxyUpstream = upstream
 		rt.pattern = opts.Pattern
 		rt.downloadRoot = opts.DownloadRoot
 	}
@@ -167,7 +203,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if rt.proxy == nil || rt.Direct(strings.TrimPrefix(r.URL.Path, "/")) {
+	if len(rt.proxyUpstream.Backends) == 0 || rt.Direct(strings.TrimPrefix(r.URL.Path, "/")) {
 		log.Printf("------ --- %s [direct]\n", r.URL)
 		rt.srv.ServeHTTP(w, r)
 		return
@@ -181,7 +217,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/@latest") {
 				if time.Since(info.ModTime()) >= ListExpire {
 					log.Printf("------ --- %s [proxy]\n", r.URL)
-					rt.proxy.ServeHTTP(w, r)
+					rt.proxyUpstream.ServeHTTP(w, r)
 				} else {
 					ctype = "text/plain; charset=UTF-8"
 					w.Header().Set("Content-Type", ctype)
@@ -201,7 +237,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if what == "list" {
 				if time.Since(info.ModTime()) >= ListExpire {
 					log.Printf("------ --- %s [proxy]\n", r.URL)
-					rt.proxy.ServeHTTP(w, r)
+					rt.proxyUpstream.ServeHTTP(w, r)
 					return
 				}
 				ctype = "text/plain; charset=UTF-8"
@@ -226,7 +262,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Printf("------ --- %s [proxy]\n", r.URL)
-	rt.proxy.ServeHTTP(w, r)
+	rt.proxyUpstream.ServeHTTP(w, r)
 	return
 }
 
